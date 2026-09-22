@@ -1,0 +1,100 @@
+name: Pi 24/7
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 15 minutes — safety net in case a run is hard-killed at 6h.
+    - cron: '*/15 * * * *'
+
+concurrency:
+  group: pi-loop
+  cancel-in-progress: false
+
+permissions:
+  contents: write       # commit state.json back
+  actions: write        # re-dispatch the workflow
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350          # 5h50m — safely under the 6h hard limit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp-dev libomp-dev build-essential
+
+      - name: Restore cached pi + state
+        id: cache-state
+        uses: actions/cache@v4
+        with:
+          path: |
+            state.json
+            pi_c_hyperspeed.txt
+          key: pi-state-v1-${{ github.run_id }}
+          restore-keys: |
+            pi-state-v1-
+
+      - name: Build
+        run: |
+          gcc -O3 -fopenmp pi.c -o pi -lgmp
+
+      - name: Run (up to ~5h)
+        run: |
+          ./pi
+
+      - name: Show state
+        if: always()
+        run: |
+          echo "--- state.json ---"
+          cat state.json 2>/dev/null || true
+          echo
+          echo "--- pi head (first 200 chars) ---"
+          head -c 200 pi_c_hyperspeed.txt 2>/dev/null || echo "(none)"
+          echo
+          echo "--- pi size ---"
+          ls -lh pi_c_hyperspeed.txt 2>/dev/null || true
+
+      - name: Save cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            state.json
+            pi_c_hyperspeed.txt
+          key: pi-state-v1-${{ github.run_id }}
+
+      - name: Upload pi as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-output-${{ github.run_id }}
+          path: |
+            pi_c_hyperspeed.txt
+            state.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Commit state.json back to repo
+        if: always()
+        run: |
+          git config user.name  "pi-bot"
+          git config user.email "pi-bot@users.noreply.github.com"
+          git add state.json || true
+          if git diff --cached --quiet; then
+            echo "No state change to commit."
+          else
+            git commit -m "pi checkpoint: $(date -u +%FT%TZ)"
+            git push
+          fi
+
+      - name: Re-trigger next run (loop)
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          sleep 5
+          gh workflow run pi.yml --ref "${GITHUB_REF_NAME}"
