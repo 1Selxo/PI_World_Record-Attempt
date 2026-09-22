@@ -15,7 +15,6 @@ mpz_t CONST_Q;
 #define STATE_FILE          "state.json"
 #define PI_FILE             "pi_c_hyperspeed.txt"
 
-// Set to non-zero by SIGTERM handler so we exit between phases cleanly.
 static volatile sig_atomic_t g_stop = 0;
 
 static void on_signal(int sig) {
@@ -23,7 +22,6 @@ static void on_signal(int sig) {
     g_stop = 1;
 }
 
-// Read starting digits from state.json. Returns default if missing/unreadable.
 static unsigned long read_start_digits(unsigned long default_digits) {
     FILE *f = fopen(STATE_FILE, "r");
     if (!f) return default_digits;
@@ -40,7 +38,6 @@ static unsigned long read_start_digits(unsigned long default_digits) {
     return v ? v : default_digits;
 }
 
-// Atomically write state so a crash mid-write doesn't corrupt it.
 static void write_state(unsigned long digits, const char *pi_file) {
     char tmpname[64];
     snprintf(tmpname, sizeof(tmpname), "%s.tmp", STATE_FILE);
@@ -57,12 +54,13 @@ static void write_state(unsigned long digits, const char *pi_file) {
     rename(tmpname, STATE_FILE);
 }
 
-// Save pi text atomically (writes to .tmp, then renames).
 static int save_pi(const char *filename, mpz_t pi_int) {
     char tmpname[128];
     snprintf(tmpname, sizeof(tmpname), "%s.tmp", filename);
     FILE *f = fopen(tmpname, "w");
     if (!f) return 0;
+    
+    // Convert to base 10 string
     char *str = mpz_get_str(NULL, 10, pi_int);
     fprintf(f, "3.%s", str + 1);
     fclose(f);
@@ -74,10 +72,26 @@ static int save_pi(const char *filename, mpz_t pi_int) {
     return rename(tmpname, filename) == 0;
 }
 
-// ---------- Binary splitting (unchanged core) ----------
+// Automatically sync to Github
+static void sync_to_github(unsigned long digits) {
+    printf("  [~] Syncing %lu digits to GitHub...\n", digits);
+    char command[512];
+    snprintf(command, sizeof(command), 
+        "git add %s %s && git commit -m \"Auto-save: Calculated %lu digits\" && git push", 
+        STATE_FILE, PI_FILE, digits);
+    
+    int ret = system(command);
+    if (ret == 0) {
+        printf("  [OK] Successfully pushed to GitHub.\n");
+    } else {
+        printf("  [!] Failed to push to GitHub (Check git credentials/network).\n");
+    }
+}
 
-void bs_seq(unsigned long a, unsigned long b, int depth, mpz_t P, mpz_t Q, mpz_t T,
-            mpz_t *P_pool, mpz_t *Q_pool, mpz_t *T_pool, mpz_t tmp) {
+// ---------- Cleaned up, hyper-fast Binary Splitting ----------
+// Replaces the extremely slow array pooling with proper Log(N) recursion
+
+void bs(unsigned long a, unsigned long b, mpz_t P, mpz_t Q, mpz_t T, int threads) {
     if (b - a == 1) {
         if (a == 0) {
             mpz_set_ui(P, 1);
@@ -87,10 +101,10 @@ void bs_seq(unsigned long a, unsigned long b, int depth, mpz_t P, mpz_t Q, mpz_t
             mpz_mul_ui(P, P, 6 * a - 1);
             mpz_mul_ui(P, P, 6 * a - 5);
 
-            mpz_set(Q, CONST_Q);
+            mpz_set_ui(Q, a);
             mpz_mul_ui(Q, Q, a);
             mpz_mul_ui(Q, Q, a);
-            mpz_mul_ui(Q, Q, a);
+            mpz_mul(Q, Q, CONST_Q);
         }
 
         mpz_set_ui(T, 545140134);
@@ -101,62 +115,37 @@ void bs_seq(unsigned long a, unsigned long b, int depth, mpz_t P, mpz_t Q, mpz_t
         if (a & 1) mpz_neg(T, T);
     } else {
         unsigned long m = (a + b) / 2;
+        mpz_t P2, Q2, T2;
+        mpz_inits(P2, Q2, T2, NULL);
 
-        bs_seq(a, m, depth + 1, P_pool[depth], Q_pool[depth], T_pool[depth],
-               P_pool, Q_pool, T_pool, tmp);
+        if (threads > 1) {
+            #pragma omp task shared(P, Q, T)
+            bs(a, m, P, Q, T, threads / 2);
 
-        bs_seq(m, b, depth + 1, P, Q, T,
-               P_pool, Q_pool, T_pool, tmp);
+            #pragma omp task shared(P2, Q2, T2)
+            bs(m, b, P2, Q2, T2, threads - (threads / 2));
 
-        mpz_mul(tmp, P_pool[depth], T);
-        mpz_mul(T, Q, T_pool[depth]);
-        mpz_add(T, T, tmp);
-
-        mpz_mul(P, P_pool[depth], P);
-        mpz_mul(Q, Q_pool[depth], Q);
-    }
-}
-
-void bs_parallel(unsigned long a, unsigned long b, mpz_t P, mpz_t Q, mpz_t T, int threads_left) {
-    if (threads_left <= 1 || (b - a) < 1000) {
-        mpz_t P_pool[32], Q_pool[32], T_pool[32], tmp;
-        for (int i = 0; i < 32; i++) {
-            mpz_inits(P_pool[i], Q_pool[i], T_pool[i], NULL);
+            #pragma omp taskwait
+        } else {
+            bs(a, m, P, Q, T, 1);
+            bs(m, b, P2, Q2, T2, 1);
         }
+
+        mpz_t tmp;
         mpz_init(tmp);
 
-        bs_seq(a, b, 0, P, Q, T, P_pool, Q_pool, T_pool, tmp);
+        // T = P1 * T2 + Q2 * T1
+        mpz_mul(tmp, P, T2);
+        mpz_mul(T, T, Q2);
+        mpz_add(T, T, tmp);
 
-        for (int i = 0; i < 32; i++) {
-            mpz_clears(P_pool[i], Q_pool[i], T_pool[i], NULL);
-        }
-        mpz_clear(tmp);
-        return;
+        // P = P1 * P2
+        mpz_mul(P, P, P2);
+        // Q = Q1 * Q2
+        mpz_mul(Q, Q, Q2);
+
+        mpz_clears(P2, Q2, T2, tmp, NULL);
     }
-
-    unsigned long m = (a + b) / 2;
-    mpz_t Pam, Qam, Tam;
-    mpz_inits(Pam, Qam, Tam, NULL);
-
-    #pragma omp task shared(Pam, Qam, Tam)
-    bs_parallel(a, m, Pam, Qam, Tam, threads_left / 2);
-
-    #pragma omp task shared(P, Q, T)
-    bs_parallel(m, b, P, Q, T, threads_left - (threads_left / 2));
-
-    #pragma omp taskwait
-
-    mpz_t tmp;
-    mpz_init(tmp);
-
-    mpz_mul(tmp, Pam, T);
-    mpz_mul(T, Q, Tam);
-    mpz_add(T, T, tmp);
-
-    mpz_mul(P, Pam, P);
-    mpz_mul(Q, Qam, Q);
-
-    mpz_clears(Pam, Qam, Tam, tmp, NULL);
 }
 
 // ---------- Main ----------
@@ -186,8 +175,7 @@ int main(int argc, char **argv) {
 
         double elapsed_total = omp_get_wtime() - process_start;
         if (elapsed_total >= MAX_RUNTIME_SECONDS) {
-            printf("[!] Time budget reached (%.1fs). Saving state for resume.\n",
-                   elapsed_total);
+            printf("[!] Time budget reached (%.1fs). Saving state for resume.\n", elapsed_total);
             write_state(digits, PI_FILE);
             break;
         }
@@ -201,11 +189,12 @@ int main(int argc, char **argv) {
         mpz_t P, Q, T;
         mpz_inits(P, Q, T, NULL);
 
+        // Trigger binary splitting
         #pragma omp parallel
         {
             #pragma omp single
             {
-                bs_parallel(0, iterations, P, Q, T, num_threads);
+                bs(0, iterations, P, Q, T, num_threads);
             }
         }
 
@@ -233,10 +222,10 @@ int main(int argc, char **argv) {
         }
 
         unsigned long next_digits = digits * 2;
-
-        // Write state AFTER every successful save so a kill mid-loop
-        // still resumes from the correct point.
         write_state(next_digits, PI_FILE);
+        
+        // PUSH TO GITHUB HERE
+        sync_to_github(digits);
 
         double end_save = omp_get_wtime();
         printf("[OK] %lu digits saved in %.4f s (session total %.4f s)\n",
@@ -246,8 +235,6 @@ int main(int argc, char **argv) {
         mpz_clears(P, Q, T, ten_pow, C_scaled, pi_int, NULL);
 
         double iter_time = end_save - start_time;
-
-        // If the NEXT iteration clearly won't fit in the remaining budget, stop now.
         if (omp_get_wtime() - process_start + iter_time * 1.2 >= MAX_RUNTIME_SECONDS) {
             printf("[!] Next iteration (~%.1fs) won't fit. Exiting for resume.\n", iter_time);
             break;
