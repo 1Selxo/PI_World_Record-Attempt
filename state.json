@@ -1,5 +1,5 @@
 {
-  "digits": 1000000,
+  "digits": 512000000,
   "pi_file": "pi_c_hyperspeed.txt",
-  "updated": 0
+  "updated": 1790078804
 }
