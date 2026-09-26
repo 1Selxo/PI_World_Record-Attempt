@@ -67,7 +67,9 @@ result as a GitHub Release asset *before* committing the advanced state. This
 avoids the much smaller Actions-artifact retention quota at record scale. A
 failed compute or result upload still saves a valid checkpoint for retry, but
 never advances the Git-tracked state. The workflow uses the built-in GitHub
-token to request the next slice; the cron schedule is a recovery fallback.
+token to request the next slice after every cached checkpoint, including a
+recoverable failed attempt. It therefore runs continuously without manual
+restarts; the 15-minute cron schedule is only a recovery fallback.
 
 After an output is written, its final math checkpoint is retained just long
 enough for the cache/release/state transaction. The next invocation removes
