@@ -1,100 +1,142 @@
-name: Pi 24/7
+name: Pi checkpoint runner
 
 on:
   workflow_dispatch:
   schedule:
-    # Every 15 minutes — safety net in case a run is hard-killed at 6h.
-    - cron: '*/15 * * * *'
+    # A safety net if the follow-up dispatch is delayed or unavailable.
+    - cron: '17 * * * *'
 
 concurrency:
-  group: pi-loop
+  # Keep exactly one writer for the checkpoint/cache on each branch.
+  group: pi-loop-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  contents: write       # commit state.json back
-  actions: write        # re-dispatch the workflow
+  contents: write
+  actions: write
 
 jobs:
   compute:
     runs-on: ubuntu-latest
-    timeout-minutes: 350          # 5h50m — safely under the 6h hard limit
+    # Normal slices stop after 20 minutes. The wider ceiling protects a rare,
+    # uninterruptible large GMP merge plus result/cache persistence.
+    timeout-minutes: 90
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgmp-dev libomp-dev build-essential
+          sudo apt-get install -y --no-install-recommends build-essential libgmp-dev
 
-      - name: Restore cached pi + state
-        id: cache-state
-        uses: actions/cache@v4
+      - name: Restore computation checkpoint
+        uses: actions/cache/restore@v4
         with:
+          # state.json is deliberately not cached: Git is its source of truth.
           path: |
-            state.json
-            pi_c_hyperspeed.txt
-          key: pi-state-v1-${{ github.run_id }}
+            pi_checkpoint
+          key: pi-checkpoint-v3-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            pi-state-v1-
+            pi-checkpoint-v3-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-
 
       - name: Build
         run: |
-          gcc -O3 -fopenmp pi.c -o pi -lgmp
+          gcc -O3 -fopenmp -Wall -Wextra -Wpedantic pi.c -o pi -lgmp
 
-      - name: Run (up to ~5h)
-        run: |
-          ./pi
+      - name: Compute a resumable slice
+        env:
+          # Leave ample time for Git/cache persistence before the runner is cut off.
+          PI_MAX_RUNTIME_SECONDS: '1200'
+          # A checkpoint boundary must comfortably fit inside a runner slice.
+          PI_CHUNK_TERMS: '100000'
+        run: ./pi
 
-      - name: Show state
+      - name: Show checkpoint status
         if: always()
         run: |
-          echo "--- state.json ---"
+          echo '--- state.json ---'
           cat state.json 2>/dev/null || true
           echo
-          echo "--- pi head (first 200 chars) ---"
-          head -c 200 pi_c_hyperspeed.txt 2>/dev/null || echo "(none)"
-          echo
-          echo "--- pi size ---"
-          ls -lh pi_c_hyperspeed.txt 2>/dev/null || true
+          echo '--- checkpoint files ---'
+          ls -lh pi_checkpoint/manifest.bin pi_c_hyperspeed.txt 2>/dev/null || true
 
-      - name: Save cache
+      - name: Check persistence outputs
+        id: files
+        # pi can fail after persisting a valid checkpoint (for example while
+        # writing output). Preserve that retryable work even on a failed run.
         if: always()
+        shell: bash
+        run: |
+          if [[ -f pi_checkpoint/manifest.bin ]]; then
+            echo 'checkpoint=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'checkpoint=false' >> "$GITHUB_OUTPUT"
+          fi
+          if [[ -s pi_c_hyperspeed.txt ]]; then
+            echo 'output=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'output=false' >> "$GITHUB_OUTPUT"
+          fi
+          if [[ -f pi_checkpoint/manifest.bin || -s pi_c_hyperspeed.txt ]]; then
+            echo 'persistable=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'persistable=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save computation checkpoint
+        if: ${{ always() && steps.files.outputs.checkpoint == 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
-            state.json
-            pi_c_hyperspeed.txt
-          key: pi-state-v1-${{ github.run_id }}
+            pi_checkpoint
+          key: pi-checkpoint-v3-${{ runner.os }}-${{ runner.arch }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Upload pi as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pi-output-${{ github.run_id }}
-          path: |
-            pi_c_hyperspeed.txt
-            state.json
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Commit state.json back to repo
-        if: always()
+      - name: Publish a newly completed result
+        # Release assets avoid the Actions-artifact storage/retention quota at
+        # record scale. This required upload happens before state advancement.
+        if: ${{ success() && steps.files.outputs.output == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name  "pi-bot"
-          git config user.email "pi-bot@users.noreply.github.com"
-          git add state.json || true
+          digits="$(jq -er '.completed_digits' state.json)"
+          if ! [[ "$digits" =~ ^[1-9][0-9]*$ ]]; then
+            echo "state.json does not name a completed target" >&2
+            exit 1
+          fi
+          if ! gh release view pi-results >/dev/null 2>&1; then
+            gh release create pi-results \
+              --target "$GITHUB_SHA" \
+              --title 'Pi computation results' \
+              --notes 'Completed decimal outputs from the resumable Pi runner.'
+          fi
+          # A hard link gives each result a stable release-asset name without
+          # copying its potentially very large decimal payload locally.
+          asset="pi-${digits}-digits.txt"
+          ln -f pi_c_hyperspeed.txt "$asset"
+          gh release upload pi-results "$asset" --clobber
+
+      - name: Commit checkpoint manifest
+        # This is deliberately after the required result upload. Cache save,
+        # release upload, and Git state commit form the persistence transaction.
+        if: ${{ success() && steps.files.outputs.persistable == 'true' }}
+        run: |
+          git config user.name 'pi-bot'
+          git config user.email 'pi-bot@users.noreply.github.com'
+          git add state.json
           if git diff --cached --quiet; then
-            echo "No state change to commit."
+            echo 'No manifest change to commit.'
           else
             git commit -m "pi checkpoint: $(date -u +%FT%TZ)"
+            # Preserve an unrelated user push made while this slice was computing.
+            git pull --rebase origin "$GITHUB_REF_NAME"
             git push
           fi
 
-      - name: Re-trigger next run (loop)
-        if: success()
+      - name: Start the next slice
+        if: ${{ success() && steps.files.outputs.persistable == 'true' }}
+        continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          sleep 5
-          gh workflow run pi.yml --ref "${GITHUB_REF_NAME}"
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pi.yml --ref "$GITHUB_REF_NAME"

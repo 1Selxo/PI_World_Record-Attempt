@@ -1,5 +1,7 @@
 pi_c_hyperspeed.txt
 pi_c_hyperspeed.txt.tmp
+pi_checkpoint/
 state.json.tmp
 pi
+pi.exe
 *.o
