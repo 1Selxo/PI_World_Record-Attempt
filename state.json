@@ -7,9 +7,9 @@
   "pi_checksum": "9904ccc252919e22",
   "discarded_checkpoint_target": 0,
   "checkpoint_dir": "pi_checkpoint",
-  "checkpoint_active": 0,
-  "checkpoint_target_digits": 0,
-  "checkpoint_completed_iterations": 0,
-  "checkpoint_total_iterations": 0,
-  "updated": 1790465936
+  "checkpoint_active": 1,
+  "checkpoint_target_digits": 1024000000,
+  "checkpoint_completed_iterations": 72205999,
+  "checkpoint_total_iterations": 72205999,
+  "updated": 1790467254
 }
