@@ -9,7 +9,7 @@
   "checkpoint_dir": "pi_checkpoint",
   "checkpoint_active": 1,
   "checkpoint_target_digits": 2048000000,
-  "checkpoint_completed_iterations": 75800000,
+  "checkpoint_completed_iterations": 130000000,
   "checkpoint_total_iterations": 144411997,
-  "updated": 1790724028
+  "updated": 1790725293
 }
